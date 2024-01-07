@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::rc::Rc;
 use alloc::{string::String, vec};
-use std::cell::RefCell;
 use std::marker::PhantomData;
 
 use bytemuck::Pod;
@@ -154,20 +152,20 @@ impl<R: WordRead> ByteBufAutomata<R> {
 
 macro_rules! activate_byte_buf_automata {
     ($self_name:ident) => {
-        $self_name.byte_buf_automata.borrow_mut().activate();
+        $self_name.byte_buf_automata.activate();
     };
 }
 
 macro_rules! deactivate_byte_buf_automata {
     ($self_name:ident) => {
-        $self_name.byte_buf_automata.borrow_mut().deactivate();
+        $self_name.byte_buf_automata.deactivate();
     };
 }
 
 /// Enables deserializing from a WordRead
 pub struct Deserializer<'de, R: WordRead + 'de> {
     reader: R,
-    byte_buf_automata: Rc<RefCell<ByteBufAutomata<R>>>,
+    byte_buf_automata: ByteBufAutomata<R>,
     phantom: core::marker::PhantomData<&'de ()>,
 }
 
@@ -270,7 +268,7 @@ impl<'de, R: WordRead + 'de> Deserializer<'de, R> {
     pub fn new(reader: R) -> Self {
         Deserializer {
             reader,
-            byte_buf_automata: Rc::new(RefCell::new(ByteBufAutomata::default())),
+            byte_buf_automata: ByteBufAutomata::default(),
             phantom: core::marker::PhantomData,
         }
     }
@@ -357,7 +355,7 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        visitor.visit_u8(self.byte_buf_automata.borrow_mut().take(&mut self.reader)?)
+        visitor.visit_u8(self.byte_buf_automata.take(&mut self.reader)?)
     }
 
     fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value>
