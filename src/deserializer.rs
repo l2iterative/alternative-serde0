@@ -91,13 +91,13 @@ pub fn from_slice<T: DeserializeOwned, P: Pod>(slice: &[P]) -> Result<T> {
     }
 }
 
-struct ByteBufStateMachine<R: WordRead> {
+struct ByteBufAutomata<R: WordRead> {
     pub is_active: bool,
     pub bytes_holder: Vec<u8>,
     pub word_read_phantom: PhantomData<R>,
 }
 
-impl<R: WordRead> Default for ByteBufStateMachine<R> {
+impl<R: WordRead> Default for ByteBufAutomata<R> {
     fn default() -> Self {
         Self {
             is_active: false,
@@ -107,7 +107,7 @@ impl<R: WordRead> Default for ByteBufStateMachine<R> {
     }
 }
 
-impl<R: WordRead> ByteBufStateMachine<R> {
+impl<R: WordRead> ByteBufAutomata<R> {
     fn activate(&mut self) {
         assert!(self.bytes_holder.is_empty());
         self.is_active = true;
@@ -152,22 +152,22 @@ impl<R: WordRead> ByteBufStateMachine<R> {
     }
 }
 
-macro_rules! activate {
+macro_rules! activate_byte_buf_automata {
     ($self_name:ident) => {
-        $self_name.byte_buf_state_machine.borrow_mut().activate();
+        $self_name.byte_buf_automata.borrow_mut().activate();
     };
 }
 
-macro_rules! deactivate {
+macro_rules! deactivate_byte_buf_automata {
     ($self_name:ident) => {
-        $self_name.byte_buf_state_machine.borrow_mut().deactivate();
+        $self_name.byte_buf_automata.borrow_mut().deactivate();
     };
 }
 
 /// Enables deserializing from a WordRead
 pub struct Deserializer<'de, R: WordRead + 'de> {
     reader: R,
-    byte_buf_state_machine: Rc<RefCell<ByteBufStateMachine<R>>>,
+    byte_buf_automata: Rc<RefCell<ByteBufAutomata<R>>>,
     phantom: core::marker::PhantomData<&'de ()>,
 }
 
@@ -270,13 +270,13 @@ impl<'de, R: WordRead + 'de> Deserializer<'de, R> {
     pub fn new(reader: R) -> Self {
         Deserializer {
             reader,
-            byte_buf_state_machine: Rc::new(RefCell::new(ByteBufStateMachine::default())),
+            byte_buf_automata: Rc::new(RefCell::new(ByteBufAutomata::default())),
             phantom: core::marker::PhantomData,
         }
     }
 
     fn try_take_word(&mut self) -> Result<u32> {
-        deactivate!(self);
+        deactivate_byte_buf_automata!(self);
         let mut val = 0u32;
         self.reader.read_words(core::slice::from_mut(&mut val))?;
         Ok(val)
@@ -347,7 +347,7 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        deactivate!(self);
+        deactivate_byte_buf_automata!(self);
         let mut bytes = [0u8; 16];
         self.reader.read_padded_bytes(&mut bytes)?;
         visitor.visit_i128(i128::from_le_bytes(bytes))
@@ -357,11 +357,7 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        visitor.visit_u8(
-            self.byte_buf_state_machine
-                .borrow_mut()
-                .take(&mut self.reader)?,
-        )
+        visitor.visit_u8(self.byte_buf_automata.borrow_mut().take(&mut self.reader)?)
     }
 
     fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value>
@@ -389,7 +385,7 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        deactivate!(self);
+        deactivate_byte_buf_automata!(self);
         let mut bytes = [0u8; 16];
         self.reader.read_padded_bytes(&mut bytes)?;
         visitor.visit_u128(u128::from_le_bytes(bytes))
@@ -486,7 +482,7 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        deactivate!(self);
+        deactivate_byte_buf_automata!(self);
         visitor.visit_newtype_struct(self)
     }
 
@@ -495,7 +491,7 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
         V: Visitor<'de>,
     {
         let len = self.try_take_word()? as usize;
-        activate!(self);
+        activate_byte_buf_automata!(self);
         visitor.visit_seq(SeqAccess {
             deserializer: self,
             len,
@@ -506,7 +502,7 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        activate!(self);
+        activate_byte_buf_automata!(self);
         visitor.visit_seq(SeqAccess {
             deserializer: self,
             len,
@@ -545,7 +541,7 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        deactivate!(self);
+        deactivate_byte_buf_automata!(self);
         self.deserialize_tuple(fields.len(), visitor)
     }
 
@@ -558,7 +554,7 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        deactivate!(self);
+        deactivate_byte_buf_automata!(self);
         visitor.visit_enum(self)
     }
 

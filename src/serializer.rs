@@ -94,13 +94,13 @@ where
     Ok(vec)
 }
 
-struct ByteBufStateMachine<W: WordWrite> {
+struct ByteBufAutomata<W: WordWrite> {
     pub is_active: bool,
     pub bytes_holder: Vec<u8>,
     pub word_write_phantom: PhantomData<W>,
 }
 
-impl<W: WordWrite> Default for ByteBufStateMachine<W> {
+impl<W: WordWrite> Default for ByteBufAutomata<W> {
     fn default() -> Self {
         Self {
             is_active: false,
@@ -110,7 +110,7 @@ impl<W: WordWrite> Default for ByteBufStateMachine<W> {
     }
 }
 
-impl<W: WordWrite> ByteBufStateMachine<W> {
+impl<W: WordWrite> ByteBufAutomata<W> {
     fn activate(&mut self) {
         assert!(self.bytes_holder.is_empty());
         self.is_active = true;
@@ -135,16 +135,16 @@ impl<W: WordWrite> ByteBufStateMachine<W> {
     }
 }
 
-macro_rules! activate {
+macro_rules! activate_byte_buf_automata {
     ($self_name:ident) => {
-        $self_name.byte_buf_state_machine.borrow_mut().activate();
+        $self_name.byte_buf_automata.borrow_mut().activate();
     };
 }
 
-macro_rules! deactivate {
+macro_rules! deactivate_byte_buf_automata {
     ($self_name:ident) => {
         $self_name
-            .byte_buf_state_machine
+            .byte_buf_automata
             .borrow_mut()
             .deactivate(&mut $self_name.stream)?;
     };
@@ -153,7 +153,7 @@ macro_rules! deactivate {
 /// Enables serializing to a stream
 pub struct Serializer<W: WordWrite> {
     stream: W,
-    byte_buf_state_machine: Rc<RefCell<ByteBufStateMachine<W>>>,
+    byte_buf_automata: Rc<RefCell<ByteBufAutomata<W>>>,
 }
 
 impl<W: WordWrite> Serializer<W> {
@@ -163,7 +163,7 @@ impl<W: WordWrite> Serializer<W> {
     pub fn new(stream: W) -> Self {
         Serializer {
             stream,
-            byte_buf_state_machine: Rc::new(RefCell::new(ByteBufStateMachine::default())),
+            byte_buf_automata: Rc::new(RefCell::new(ByteBufAutomata::default())),
         }
     }
 }
@@ -191,7 +191,7 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_bool(self, v: bool) -> Result<()> {
-        deactivate!(self);
+        deactivate_byte_buf_automata!(self);
         self.serialize_u8(if v { 1 } else { 0 })
     }
 
@@ -216,7 +216,7 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_u8(self, v: u8) -> Result<()> {
-        if self.byte_buf_state_machine.borrow_mut().take(v) {
+        if self.byte_buf_automata.borrow_mut().take(v) {
             Ok(())
         } else {
             self.serialize_u32(v as u32)
@@ -228,7 +228,7 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_u32(self, v: u32) -> Result<()> {
-        deactivate!(self);
+        deactivate_byte_buf_automata!(self);
         self.stream.write_words(&[v])
     }
 
@@ -306,7 +306,7 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     where
         T: serde::Serialize + ?Sized,
     {
-        deactivate!(self);
+        deactivate_byte_buf_automata!(self);
         value.serialize(self)
     }
 
@@ -328,7 +328,7 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
         match len {
             Some(val) => {
                 self.serialize_u32(val.try_into().unwrap())?;
-                activate!(self);
+                activate_byte_buf_automata!(self);
                 Ok(self)
             }
             None => Err(Error::NotSupported),
@@ -336,7 +336,7 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple> {
-        activate!(self);
+        activate_byte_buf_automata!(self);
         Ok(self)
     }
 
@@ -345,7 +345,7 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
         _name: &'static str,
         _len: usize,
     ) -> Result<Self::SerializeTupleStruct> {
-        deactivate!(self);
+        deactivate_byte_buf_automata!(self);
         Ok(self)
     }
 
@@ -371,7 +371,7 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self::SerializeStruct> {
-        deactivate!(self);
+        deactivate_byte_buf_automata!(self);
         Ok(self)
     }
 
@@ -399,7 +399,7 @@ impl<'a, W: WordWrite> serde::ser::SerializeSeq for &'a mut Serializer<W> {
     }
 
     fn end(self) -> Result<()> {
-        deactivate!(self);
+        deactivate_byte_buf_automata!(self);
         Ok(())
     }
 }
@@ -416,7 +416,7 @@ impl<'a, W: WordWrite> serde::ser::SerializeTuple for &'a mut Serializer<W> {
     }
 
     fn end(self) -> Result<()> {
-        deactivate!(self);
+        deactivate_byte_buf_automata!(self);
         Ok(())
     }
 }
