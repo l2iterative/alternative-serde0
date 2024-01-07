@@ -37,7 +37,10 @@ pub trait Serializer: Sized {
 }
 ```
 
-The issue is that we may want to specify different rules for different `T`, particularly, if `T = u8`, for better 
+This would impact RISC Zero because now, to serialize a byte array `Vec<u8>`, each number would be converted into u32, and an 
+array of `Vec<u32>` are to be serialized, which leads to 4x storage overhead. 
+
+Back to the serde discussion. The issue is that we may want to specify different rules for different `T`, particularly, if `T = u8`, for better 
 efficiency. One solution is the [serde_bytes](https://docs.rs/serde_bytes/latest/serde_bytes/index.html) crate, which 
 allows one to bypass the limitation through a customized serde function.
 ```rust
