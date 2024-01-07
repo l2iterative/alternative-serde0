@@ -10,7 +10,7 @@ more compact format.
 RISC Zero serializes the input to the zkVM into a vector of `u32`, through the `serde` framework. 
 This, however, means that it suffers from one of the major open problems in Rust.
 
-When `serde` derives `Serialize` and `Deserialize` for Rust data structures, it has the following implementation:
+When `serde` implements `Serialize` and `Deserialize` for Rust data structures, it has the following implementation:
 ```rust
 impl<T> Serialize for Vec<T> where T: Serialize
 {
@@ -59,8 +59,8 @@ struct Efficient<'a> {
 }
 ```
 
-The idea is to implement a different derivation strategy that does not derive `Vec<T>` for any serializable `T`, and 
-ask the developer to switch between these two strategies. There are a few problems with this approach:
+The idea is to implement a different implementation strategy that does not apply a generic rule to `Vec<T>` (for any serializable `T`), and 
+asks the developer to switch between these two strategies. There are a few problems with this approach:
 - It requires developers to modify the layers and layers of abstractions. If a developer uses four crates---A, B, C, 
 D---A depends on B, B depends on C, C depends on D, and D uses `Vec<u8>`, the developer needs to go all the way down to 
 D to change the definitions of its data structures. This can cause compatibility issues with the rest of the system. 
@@ -75,7 +75,7 @@ discouraged, and would not be suitable for RISC Zero's zkVM because it is in the
 
 ## Our solution
 
-Prior discussion shows that a bottom-up approach can be a disaster. This repository suggests a top-down approach, or in 
+Prior discussion shows that a bottom-up approach can be disastrous. This repository suggests a top-down approach, or in 
 other words, we do not require any modification to the existing data structures implemented in Rust, but instead, we 
 present a serializer that converts RISC Zero input into `Vec<u32>`, with the corresponding deserialization.
 
