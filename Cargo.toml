@@ -1,0 +1,27 @@
+[package]
+name = "risc0_serde"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+risc0-zkvm = {version = "0.19.1" }
+risc0-zkvm-platform = { version = "0.19.1"}
+serde = { version = "1.0.195", features = ["derive"] }
+bytemuck = { version = "1.14.0", features = [] }
+bytes = { version = "1.5.0", features = [] }
+
+
+# Always optimize; otherwise tests take excessively long.
+[profile.dev]
+opt-level = 3
+
+[profile.dev.build-override]
+opt-level = 3
+
+[profile.release]
+lto = true
+
+[profile.release.build-override]
+opt-level = 3
