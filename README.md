@@ -86,8 +86,10 @@ that RISC Zero recommends.
 - A sequence whose *immediate* child is `u8`, no exception. This applies to `[u8]`, `Vec<u8>`.
 - The starting segment of a tuple that consists of only `u8`, which applies to `[u8; 0..=32]` and 
 `(u8, u8, u8, ..., u8, T, ...)`. Of course, one may prefer to support only the former but not the latter, but this is 
-not possible as `serde` interprets the short `u8` vector as like tuple, so in order to support short `u8` vector, we 
-have to allow the starting segment of a tuple.
+not possible as `serde` interprets the short `u8` vector as like tuple, so in order to support short `u8` vectors, we 
+have to handle the starting segment of a tuple of type `u8`. This is not disadvantagous because we also save space for storing the tuple.
+If we really want to disgintuish them, it is likely that the serializer needs to leave hints to the deserializer, as
+serialization itself is an art from left to right, and the deserializer does not have the ability to look ahead. 
 
 The finite-state automata, throughout the process, is being activated and deactivated.
 - **Activate:** The start of serializing a sequence or a tuple would activate it.
