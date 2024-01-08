@@ -80,25 +80,16 @@ other words, we do not require any modification to the existing data structures 
 present a serializer that converts RISC Zero input into `Vec<u32>`, with the corresponding deserialization.
 
 The idea is to run a finite-state automata (called `ByteBufAutomata`) alongside the serialization, and when it 
-observes the following, it temporarily modifies the way of serialization so that it resembles the padded-to-word approach 
-that RISC Zero recommends. 
-
-- A sequence whose *immediate* child is `u8`, no exception. This applies to `[u8]`, `Vec<u8>`.
-- The starting segment of a tuple that consists of only `u8`, which applies to `[u8; 0..=32]` and 
-`(u8, u8, u8, ..., u8, T, ...)`. Of course, one may prefer to support only the former but not the latter, but this is 
-not possible as `serde` interprets the short `u8` vector as like tuple, so in order to support short `u8` vectors, we 
-have to handle the starting segment of a tuple of type `u8`. This is not disadvantagous because we also save space for storing the tuple.
-If we really want to disgintuish them, it is likely that the serializer needs to leave hints to the deserializer, as
-serialization itself is an art from left to right, and the deserializer does not have the ability to look ahead. 
+observes several continuous u8 being serialized together, it temporarily modifies the way of serialization so that 
+it resembles the padded-to-word approach that RISC Zero recommends. 
 
 The finite-state automata, throughout the process, is being activated and deactivated.
-- **Activate:** The start of serializing a sequence or a tuple would activate it.
-- **Deactivate:** Virtually all of remaining serialization steps other than serializing `u8` would deactivate it. When it 
-is deactivated, it serializes the receiving `u8` into a compact and padded `Vec<u32>`. The end of serializing a sequence 
-or a tuple would also deactivate it.
+- **Activate:** It activates when it encounters a `u8`.
+- **Deactivate:** Serializing the rest of the basic types would deactivate it. 
 
 When the machine is active, serializing and deserializing over `u8` would be different.
-- **Serialize:** The automata withholds the `u8` and would serialize them altogether with deactivated.
+- **Serialize:** If the previous `u8` has not taken a full word, the new `u8` would be snuck into that word. Otherwise,
+  a new word is created. 
 - **Deserialize:** To read a single `u8`, the automata reads an entire word, converts it into four bytes, and supplies 
 these four bytes. This process repeats until the automata is deactivated, at which moment either there are not remaining 
 bytes or all the remaining bytes are zeros.
@@ -107,7 +98,7 @@ Detail of the implementation can be found in the codebase. Below we summarize th
 
 ### Serialization
 
-The old code for `serialize_u8`, `serialize_seq`, and `serialize_struct` are good examples to compare the code before and after, 
+The old code for `serialize_u8` and `serialize_u32` are good examples to compare the code before and after, 
 other than the code for the new finite-state automata.
 
 ```rust
@@ -117,57 +108,34 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
         self.serialize_u32(v as u32)
     }
 
-    fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq> {
-        match len {
-            Some(val) => {
-                self.serialize_u32(val.try_into().unwrap())?;
-                Ok(self)
-            }
-            None => Err(Error::NotSupported),
-        }
-    }
-
-    fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self::SerializeStruct> {
-        Ok(self)
+    fn serialize_u32(self, v: u32) -> Result<()> {
+        self.stream.write_words(&[v]);
+        Ok(())
     }
 }
 
 // New
 impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     fn serialize_u8(self, v: u8) -> Result<()> {
-        if self.byte_buf_automata.borrow_mut().take(v) {
-            Ok(())
-        } else {
-            self.serialize_u32(v as u32)
-        }
+        activate_byte_buf_automata_and_take!(self, v);
+        Ok(())
     }
 
-    fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq> {
-        match len {
-            Some(val) => {
-                self.serialize_u32(val.try_into().unwrap())?;
-                activate_byte_buf_automata!(self);
-                Ok(self)
-            }
-            None => Err(Error::NotSupported),
-        }
-    }
-
-
-    fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self::SerializeStruct> {
+    fn serialize_u32(self, v: u32) -> Result<()> {
         deactivate_byte_buf_automata!(self);
-        Ok(self)
+        self.stream.write_word(v);
+        Ok(())
     }
 }
 ```
 
-The main changes are `activate!(self)` and `deactivate!(self)`, which are helpful macros that activate or deactivate the 
-automata.
+The main changes are `activate_byte_buf_automata_and_take!(self)` and `deactivate_byte_buf_automata!(self)`, 
+which are helpful macros that activate or deactivate the automata.
 
 ### Deserialization
 
 Similarly, the code change outside the automata is minimal, consisting of redirection on `deserialize_u8` and 
-insertions of `activate!(self)` and `deactivate!(self)` macro calls.
+insertions of `activate_byte_buf_automata_and_take!(self)` and `deactivate_byte_buf_automata!(self)` macro calls.
 
 ```rust
 // old
@@ -179,19 +147,13 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
         visitor.visit_u32(self.try_take_word()?)
     }
 
-    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value>
-        where
-            V: Visitor<'de>,
+    fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
     {
-        let len = self.try_take_word()? as usize;
-        visitor.visit_seq(SeqAccess {
-            deserializer: self,
-            len,
-        })
-    }
-
-    fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self::SerializeStruct> {
-        Ok(self)
+        let mut bytes = [0u8; 16];
+        self.reader.read_padded_bytes(&mut bytes)?;
+        visitor.visit_u128(u128::from_le_bytes(bytes))
     }
 }
 
@@ -201,25 +163,17 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
         where
             V: Visitor<'de>,
     {
-
-        visitor.visit_u8(self.byte_buf_automata.borrow_mut().take(&mut self.reader)?)
+        visitor.visit_u8(activate_byte_buf_automata_and_take!(self))
     }
 
-    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value>
-        where
-            V: Visitor<'de>,
+    fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
     {
-        let len = self.try_take_word()? as usize;
-        activate_byte_buf_automata!(self);
-        visitor.visit_seq(SeqAccess {
-            deserializer: self,
-            len,
-        })
-    }
-
-    fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self::SerializeStruct> {
         deactivate_byte_buf_automata!(self);
-        Ok(self)
+        let mut bytes = [0u8; 16];
+        self.reader.read_padded_bytes(&mut bytes)?;
+        visitor.visit_u128(u128::from_le_bytes(bytes))
     }
 }
 ```
@@ -249,6 +203,12 @@ byte buffer.
 We may update the Bonsai PHP SDK, but we warn that there are going to be overhead. The fact that short u8 vectors are 
 being treated as tuples force us to serialize some tuples in the same way, and PHP needs to conform to these existing 
 serde practice.
+
+### Updates
+
+Note that the serialization algorithm is completely different from previous commits due to discussion in https://github.com/risc0/risc0/issues/1298.
+
+I would like to credit @austinabell for the thought process of leading to this new algorithm.
 
 ### License
 
