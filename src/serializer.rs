@@ -245,7 +245,7 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
 
     fn serialize_u32(self, v: u32) -> Result<()> {
         deactivate_byte_buf_automata!(self);
-        self.stream.write_words(&[v]);
+        self.stream.write_word(v);
         Ok(())
     }
 
