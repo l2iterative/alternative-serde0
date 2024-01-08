@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use alloc::{string::String, vec};
-use std::marker::PhantomData;
 
 use bytemuck::Pod;
 use risc0_zkvm_platform::WORD_SIZE;
@@ -89,28 +88,21 @@ pub fn from_slice<T: DeserializeOwned, P: Pod>(slice: &[P]) -> Result<T> {
     }
 }
 
-struct ByteBufAutomata<R: WordRead> {
+struct ByteBufAutomata {
     pub is_active: bool,
     pub bytes_holder: Vec<u8>,
-    pub word_read_phantom: PhantomData<R>,
 }
 
-impl<R: WordRead> Default for ByteBufAutomata<R> {
+impl Default for ByteBufAutomata {
     fn default() -> Self {
         Self {
             is_active: false,
-            bytes_holder: vec![],
-            word_read_phantom: PhantomData,
+            bytes_holder: Vec::<u8>::with_capacity(4),
         }
     }
 }
 
-impl<R: WordRead> ByteBufAutomata<R> {
-    fn activate(&mut self) {
-        assert!(self.bytes_holder.is_empty());
-        self.is_active = true;
-    }
-
+impl ByteBufAutomata {
     fn deactivate(&mut self) {
         if !self.bytes_holder.is_empty() {
             let len = self.bytes_holder.len();
@@ -128,36 +120,36 @@ impl<R: WordRead> ByteBufAutomata<R> {
         self.is_active = false;
     }
 
-    fn take(&mut self, reader: &mut R) -> Result<u8> {
-        return if self.is_active {
-            if !self.bytes_holder.is_empty() {
-                Ok(self.bytes_holder.pop().unwrap())
-            } else {
-                let mut val = 0u32;
-                reader.read_words(core::slice::from_mut(&mut val))?;
-                self.bytes_holder = vec![
-                    (val >> 24 & 0xff) as u8,
-                    (val >> 16 & 0xff) as u8,
-                    (val >> 8 & 0xff) as u8,
-                ];
-                Ok((val & 0xff) as u8)
-            }
+    fn activate_and_take<R: WordRead>(&mut self, reader: &mut R) -> Result<u8> {
+        if !self.is_active {
+            assert!(self.bytes_holder.is_empty());
+            self.is_active = true;
+        }
+        if !self.bytes_holder.is_empty() {
+            Ok(self.bytes_holder.pop().unwrap())
         } else {
             let mut val = 0u32;
             reader.read_words(core::slice::from_mut(&mut val))?;
-            Ok(val as u8)
-        };
+            self.bytes_holder = vec![
+                (val >> 24 & 0xff) as u8,
+                (val >> 16 & 0xff) as u8,
+                (val >> 8 & 0xff) as u8,
+            ];
+            Ok((val & 0xff) as u8)
+        }
     }
 }
 
-macro_rules! activate_byte_buf_automata {
-    ($self_name:ident) => {
-        $self_name.byte_buf_automata.activate();
+macro_rules! activate_byte_buf_automata_and_take {
+    ($self_name:expr) => {
+        $self_name
+            .byte_buf_automata
+            .activate_and_take(&mut $self_name.reader)?
     };
 }
 
 macro_rules! deactivate_byte_buf_automata {
-    ($self_name:ident) => {
+    ($self_name:expr) => {
         $self_name.byte_buf_automata.deactivate();
     };
 }
@@ -165,7 +157,7 @@ macro_rules! deactivate_byte_buf_automata {
 /// Enables deserializing from a WordRead
 pub struct Deserializer<'de, R: WordRead + 'de> {
     reader: R,
-    byte_buf_automata: ByteBufAutomata<R>,
+    byte_buf_automata: ByteBufAutomata,
     phantom: core::marker::PhantomData<&'de ()>,
 }
 
@@ -243,10 +235,10 @@ impl<'a, 'de: 'a, R: WordRead + 'de> serde::de::MapAccess<'de> for MapAccess<'a,
     fn next_key_seed<K: DeserializeSeed<'de>>(&mut self, seed: K) -> Result<Option<K::Value>> {
         if self.len > 0 {
             self.len -= 1;
-            Ok(Some(DeserializeSeed::deserialize(
+            return Ok(Some(DeserializeSeed::deserialize(
                 seed,
                 &mut *self.deserializer,
-            )?))
+            )?));
         } else {
             Ok(None)
         }
@@ -305,7 +297,7 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        let val = match self.try_take_word()? {
+        let val = match activate_byte_buf_automata_and_take!(self) {
             0 => false,
             1 => true,
             _ => return Err(Error::DeserializeBadBool),
@@ -355,7 +347,7 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        visitor.visit_u8(self.byte_buf_automata.take(&mut self.reader)?)
+        visitor.visit_u8(activate_byte_buf_automata_and_take!(self))
     }
 
     fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value>
@@ -480,7 +472,6 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        deactivate_byte_buf_automata!(self);
         visitor.visit_newtype_struct(self)
     }
 
@@ -489,7 +480,6 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
         V: Visitor<'de>,
     {
         let len = self.try_take_word()? as usize;
-        activate_byte_buf_automata!(self);
         visitor.visit_seq(SeqAccess {
             deserializer: self,
             len,
@@ -500,7 +490,6 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        activate_byte_buf_automata!(self);
         visitor.visit_seq(SeqAccess {
             deserializer: self,
             len,
@@ -539,7 +528,6 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        deactivate_byte_buf_automata!(self);
         self.deserialize_tuple(fields.len(), visitor)
     }
 
@@ -552,7 +540,6 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        deactivate_byte_buf_automata!(self);
         visitor.visit_enum(self)
     }
 
@@ -592,6 +579,7 @@ mod tests {
     fn test_enum_unary() {
         let a = MyEnum::MyUnaryConstructor(vec![1, 2, 3, 4, 5]);
         let encoded = crate::to_vec(&a).unwrap();
+        println!("{:?}", encoded);
         let decoded: MyEnum = from_slice(&encoded).unwrap();
         assert_eq!(a, decoded);
     }

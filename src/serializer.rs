@@ -15,7 +15,6 @@
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use std::cell::RefCell;
-use std::marker::PhantomData;
 
 use risc0_zkvm_platform::WORD_SIZE;
 
@@ -23,8 +22,17 @@ use super::err::{Error, Result};
 
 /// A writer for writing streams preferring word-based data.
 pub trait WordWrite {
+    /// Access the last word
+    fn get_last_word(&self) -> u32;
+
+    /// Modify the last word
+    fn set_last_word(&mut self, last_word: u32);
+
+    /// Write the given word to the stream.
+    fn write_word(&mut self, word: u32);
+
     /// Write the given words to the stream.
-    fn write_words(&mut self, words: &[u32]) -> Result<()>;
+    fn write_words(&mut self, words: &[u32]);
 
     /// Write the given bytes to the stream, padding up to the next word
     /// boundary.
@@ -32,16 +40,34 @@ pub trait WordWrite {
     // posix-style I/O that can read things into buffers right where
     // we want them to be?  If we don't, we could change the
     // serialization buffers to use Vec<u8> instead of Vec<u32>,
-    fn write_padded_bytes(&mut self, bytes: &[u8]) -> Result<()>;
+    fn write_padded_bytes(&mut self, bytes: &[u8]);
 }
 
 impl WordWrite for Vec<u32> {
-    fn write_words(&mut self, words: &[u32]) -> Result<()> {
-        self.extend_from_slice(words);
-        Ok(())
+    #[inline]
+    fn get_last_word(&self) -> u32 {
+        let len = self.len();
+        self[len - 1]
     }
 
-    fn write_padded_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+    #[inline]
+    fn set_last_word(&mut self, last_word: u32) {
+        let len = self.len();
+        self[len - 1] = last_word;
+    }
+
+    #[inline]
+    fn write_word(&mut self, word: u32) {
+        self.push(word);
+    }
+
+    #[inline]
+    fn write_words(&mut self, words: &[u32]) {
+        self.extend_from_slice(words);
+    }
+
+    #[inline]
+    fn write_padded_bytes(&mut self, bytes: &[u8]) {
         let chunks = bytes.chunks_exact(WORD_SIZE);
         let last_word = chunks.remainder();
         self.extend(chunks.map(|word_bytes| u32::from_le_bytes(word_bytes.try_into().unwrap())));
@@ -50,19 +76,33 @@ impl WordWrite for Vec<u32> {
             last_word_bytes[..last_word.len()].clone_from_slice(last_word);
             self.push(u32::from_le_bytes(last_word_bytes));
         }
-        Ok(())
     }
 }
 
 // Allow borrowed WordWrites to work transparently.
 impl<W: WordWrite + ?Sized> WordWrite for &mut W {
     #[inline]
-    fn write_words(&mut self, words: &[u32]) -> Result<()> {
+    fn get_last_word(&self) -> u32 {
+        (**self).get_last_word()
+    }
+
+    #[inline]
+    fn set_last_word(&mut self, last_word: u32) {
+        (**self).set_last_word(last_word)
+    }
+
+    #[inline]
+    fn write_word(&mut self, word: u32) {
+        (**self).write_word(word)
+    }
+
+    #[inline]
+    fn write_words(&mut self, words: &[u32]) {
         (**self).write_words(words)
     }
 
     #[inline]
-    fn write_padded_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+    fn write_padded_bytes(&mut self, bytes: &[u8]) {
         (**self).write_padded_bytes(bytes)
     }
 }
@@ -94,66 +134,46 @@ where
     Ok(vec)
 }
 
-struct ByteBufAutomata<W: WordWrite> {
-    pub is_active: bool,
-    pub bytes_holder: Vec<u8>,
-    pub word_write_phantom: PhantomData<W>,
-}
+#[derive(Default)]
+struct ByteBufAutomata(pub u8);
 
-impl<W: WordWrite> Default for ByteBufAutomata<W> {
-    fn default() -> Self {
-        Self {
-            is_active: false,
-            bytes_holder: vec![],
-            word_write_phantom: PhantomData,
-        }
-    }
-}
-
-impl<W: WordWrite> ByteBufAutomata<W> {
-    fn activate(&mut self) {
-        assert!(self.bytes_holder.is_empty());
-        self.is_active = true;
+impl ByteBufAutomata {
+    #[inline(always)]
+    fn deactivate(&mut self) {
+        self.0 = 0;
     }
 
-    fn deactivate(&mut self, stream: &mut W) -> Result<()> {
-        if !self.bytes_holder.is_empty() {
-            stream.write_padded_bytes(&self.bytes_holder)?;
-            self.bytes_holder.clear();
-        }
-        self.is_active = false;
-        Ok(())
-    }
-
-    fn take(&mut self, v: u8) -> bool {
-        return if self.is_active {
-            self.bytes_holder.push(v);
-            true
+    fn activate_and_take<W: WordWrite>(&mut self, stream: &mut W, v: u8) {
+        if self.0 == 0 {
+            stream.write_word(v as u32);
+            self.0 = 1;
         } else {
-            false
-        };
+            let w = stream.get_last_word();
+            stream.set_last_word(w | ((v as u32) << (self.0 as usize * 8)));
+            self.0 = (self.0 + 1) % 4;
+        }
     }
 }
 
-macro_rules! activate_byte_buf_automata {
-    ($self_name:ident) => {
-        $self_name.byte_buf_automata.borrow_mut().activate();
+macro_rules! activate_byte_buf_automata_and_take {
+    ($self_name:ident, $v: expr) => {
+        $self_name
+            .byte_buf_automata
+            .borrow_mut()
+            .activate_and_take(&mut $self_name.stream, $v)
     };
 }
 
 macro_rules! deactivate_byte_buf_automata {
     ($self_name:ident) => {
-        $self_name
-            .byte_buf_automata
-            .borrow_mut()
-            .deactivate(&mut $self_name.stream)?;
+        $self_name.byte_buf_automata.borrow_mut().deactivate();
     };
 }
 
 /// Enables serializing to a stream
 pub struct Serializer<W: WordWrite> {
     stream: W,
-    byte_buf_automata: Rc<RefCell<ByteBufAutomata<W>>>,
+    byte_buf_automata: Rc<RefCell<ByteBufAutomata>>,
 }
 
 impl<W: WordWrite> Serializer<W> {
@@ -191,7 +211,6 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_bool(self, v: bool) -> Result<()> {
-        deactivate_byte_buf_automata!(self);
         self.serialize_u8(if v { 1 } else { 0 })
     }
 
@@ -216,11 +235,8 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_u8(self, v: u8) -> Result<()> {
-        if self.byte_buf_automata.borrow_mut().take(v) {
-            Ok(())
-        } else {
-            self.serialize_u32(v as u32)
-        }
+        activate_byte_buf_automata_and_take!(self, v);
+        Ok(())
     }
 
     fn serialize_u16(self, v: u16) -> Result<()> {
@@ -229,7 +245,8 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
 
     fn serialize_u32(self, v: u32) -> Result<()> {
         deactivate_byte_buf_automata!(self);
-        self.stream.write_words(&[v])
+        self.stream.write_words(&[v]);
+        Ok(())
     }
 
     fn serialize_u64(self, v: u64) -> Result<()> {
@@ -238,7 +255,9 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_u128(self, v: u128) -> Result<()> {
-        self.stream.write_padded_bytes(&v.to_le_bytes())
+        deactivate_byte_buf_automata!(self);
+        self.stream.write_padded_bytes(&v.to_le_bytes());
+        Ok(())
     }
 
     fn serialize_f32(self, v: f32) -> Result<()> {
@@ -256,7 +275,8 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     fn serialize_str(self, v: &str) -> Result<()> {
         let bytes = v.as_bytes();
         self.serialize_u32(bytes.len() as u32)?;
-        self.stream.write_padded_bytes(bytes)
+        self.stream.write_padded_bytes(bytes);
+        Ok(())
     }
 
     // NOTE: Serializing byte slices _does not_ currently call serialize_bytes. This
@@ -270,7 +290,8 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     //    features.
     fn serialize_bytes(self, v: &[u8]) -> Result<()> {
         self.serialize_u32(v.len() as u32)?;
-        self.stream.write_padded_bytes(v)
+        self.stream.write_padded_bytes(v);
+        Ok(())
     }
 
     fn serialize_none(self) -> Result<()> {
@@ -306,7 +327,6 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     where
         T: serde::Serialize + ?Sized,
     {
-        deactivate_byte_buf_automata!(self);
         value.serialize(self)
     }
 
@@ -328,7 +348,6 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
         match len {
             Some(val) => {
                 self.serialize_u32(val.try_into().unwrap())?;
-                activate_byte_buf_automata!(self);
                 Ok(self)
             }
             None => Err(Error::NotSupported),
@@ -336,7 +355,6 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple> {
-        activate_byte_buf_automata!(self);
         Ok(self)
     }
 
@@ -345,7 +363,6 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
         _name: &'static str,
         _len: usize,
     ) -> Result<Self::SerializeTupleStruct> {
-        deactivate_byte_buf_automata!(self);
         Ok(self)
     }
 
@@ -371,7 +388,6 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self::SerializeStruct> {
-        deactivate_byte_buf_automata!(self);
         Ok(self)
     }
 
@@ -399,7 +415,6 @@ impl<'a, W: WordWrite> serde::ser::SerializeSeq for &'a mut Serializer<W> {
     }
 
     fn end(self) -> Result<()> {
-        deactivate_byte_buf_automata!(self);
         Ok(())
     }
 }
@@ -416,7 +431,6 @@ impl<'a, W: WordWrite> serde::ser::SerializeTuple for &'a mut Serializer<W> {
     }
 
     fn end(self) -> Result<()> {
-        deactivate_byte_buf_automata!(self);
         Ok(())
     }
 }
