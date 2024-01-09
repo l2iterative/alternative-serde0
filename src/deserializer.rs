@@ -116,9 +116,12 @@ impl ByteBufAutomata {
                 assert_eq!(self.bytes_holder[0], 0);
             }
             if len == 2 {
+                assert_eq!(self.bytes_holder[0], 0);
                 assert_eq!(self.bytes_holder[1], 0);
             }
             if len == 3 {
+                assert_eq!(self.bytes_holder[0], 0);
+                assert_eq!(self.bytes_holder[1], 0);
                 assert_eq!(self.bytes_holder[2], 0);
             }
         }
