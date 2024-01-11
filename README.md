@@ -2,6 +2,12 @@
 
 <img src="title.png" align="right" alt="a group of people in a very crowded train" width="300"/>
 
+This repository is now obsolete as the algorithm it uses has been challenged due to RISC Zero's another data structure, FdWriter.
+
+A different algorithm is currently being circulated for discussion and extra review in https://github.com/risc0/risc0/pull/1303.
+
+### Previous readme
+
 This repository presents an alternative serialization for RISC Zero that handles `Vec<u8>` as well as some tuples in a 
 more compact format.
 
