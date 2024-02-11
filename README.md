@@ -139,8 +139,7 @@ must be emitted, and the buffer needs to be emptied.
 
 ### Deserialization
 
-Similarly, the code change consists of redirection on `deserialize_u8` and insertions of 
-`activate_byte_buf_automata_and_take!(self)` and `deactivate_byte_buf_automata!(self)` macro calls.
+Similarly, the code change consists of redirection on `deserialize_u8` and insertions of the byte handler.
 
 ```rust
 // old
