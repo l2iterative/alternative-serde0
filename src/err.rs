@@ -22,6 +22,8 @@ pub enum Error {
     Custom(String),
     /// Found a bool that wasn't 0 or 1
     DeserializeBadBool,
+    /// Found some nonzero bytes in the buffer
+    DeserializeBadByte,
     /// Found an invalid unicode char
     DeserializeBadChar,
     /// Found an Option discriminant that wasn't 0 or 1
@@ -44,6 +46,7 @@ impl Display for Error {
         formatter.write_str(match self {
             Self::Custom(msg) => msg,
             Self::DeserializeBadBool => "Found a bool that wasn't 0 or 1",
+            Self::DeserializeBadByte => "Found some nonzero bytes in the buffer",
             Self::DeserializeBadChar => "Found an invalid unicode char",
             Self::DeserializeBadOption => "Found an Option discriminant that wasn't 0 or 1",
             Self::DeserializeBadUtf8 => "Tried to parse invalid utf-8",
@@ -68,3 +71,18 @@ impl serde::de::Error for Error {
 
 // This is an alias for either std::Error, or serde's no_std error replacement.
 impl serde::ser::StdError for Error {}
+
+impl From<risc0_zkvm::serde::Error> for Error {
+    fn from(value: risc0_zkvm::serde::Error) -> Self {
+        match value {
+            risc0_zkvm::serde::Error::Custom(s) => Error::Custom(s),
+            risc0_zkvm::serde::Error::DeserializeBadBool => Error::DeserializeBadBool,
+            risc0_zkvm::serde::Error::DeserializeBadChar => Error::DeserializeBadChar,
+            risc0_zkvm::serde::Error::DeserializeBadOption => Error::DeserializeBadOption,
+            risc0_zkvm::serde::Error::DeserializeBadUtf8 => Error::DeserializeBadUtf8,
+            risc0_zkvm::serde::Error::DeserializeUnexpectedEnd => Error::DeserializeUnexpectedEnd,
+            risc0_zkvm::serde::Error::NotSupported => Error::NotSupported,
+            risc0_zkvm::serde::Error::SerializeBufferFull => Error::SerializeBufferFull,
+        }
+    }
+}

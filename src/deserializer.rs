@@ -15,64 +15,17 @@
 use alloc::{string::String, vec};
 
 use bytemuck::Pod;
-use risc0_zkvm_platform::WORD_SIZE;
+use risc0_zkvm::serde::WordRead;
 use serde::de::{DeserializeOwned, DeserializeSeed, IntoDeserializer, Visitor};
 
 use super::err::{Error, Result};
-use crate::align_up;
-
-/// A reader for reading streams with serialized word-based data
-pub trait WordRead {
-    /// Fill the given buffer with words from input.  Returns an error if EOF
-    /// was encountered.
-    fn read_words(&mut self, words: &mut [u32]) -> Result<()>;
-
-    /// Fill the given buffer with bytes from input, and discard the
-    /// padding up to the next word boundary.  Returns an error if EOF was
-    /// encountered.
-    fn read_padded_bytes(&mut self, bytes: &mut [u8]) -> Result<()>;
-}
-
-// Allow borrowed WordReads to work transparently
-impl<R: WordRead + ?Sized> WordRead for &mut R {
-    fn read_words(&mut self, words: &mut [u32]) -> Result<()> {
-        (**self).read_words(words)
-    }
-
-    fn read_padded_bytes(&mut self, bytes: &mut [u8]) -> Result<()> {
-        (**self).read_padded_bytes(bytes)
-    }
-}
-
-impl WordRead for &[u32] {
-    fn read_words(&mut self, out: &mut [u32]) -> Result<()> {
-        if out.len() > self.len() {
-            Err(Error::DeserializeUnexpectedEnd)
-        } else {
-            out.clone_from_slice(&self[..out.len()]);
-            (_, *self) = self.split_at(out.len());
-            Ok(())
-        }
-    }
-
-    fn read_padded_bytes(&mut self, out: &mut [u8]) -> Result<()> {
-        let bytes: &[u8] = bytemuck::cast_slice(self);
-        if out.len() > bytes.len() {
-            Err(Error::DeserializeUnexpectedEnd)
-        } else {
-            out.clone_from_slice(&bytes[..out.len()]);
-            (_, *self) = self.split_at(align_up(out.len(), WORD_SIZE) / WORD_SIZE);
-            Ok(())
-        }
-    }
-}
 
 /// Deserialize a slice into the specified type.
 ///
 /// Deserialize `slice` into type `T`. Returns an `Err` if deserialization isn't
 /// possible, such as if `slice` is not the serialized form of an object of type
 /// `T`.
-pub fn from_slice<T: DeserializeOwned, P: Pod>(slice: &[P]) -> Result<T> {
+pub fn from_slice_compact<T: DeserializeOwned, P: Pod>(slice: &[P]) -> Result<T> {
     match bytemuck::try_cast_slice(slice) {
         Ok(slice) => {
             let mut deserializer = Deserializer::new(slice);
@@ -88,103 +41,56 @@ pub fn from_slice<T: DeserializeOwned, P: Pod>(slice: &[P]) -> Result<T> {
     }
 }
 
-// ******************************************************
-// ******************************************************
-// **** START added in the alternative serialization ****
-// ******************************************************
-// ******************************************************
-
-struct ByteBufAutomata {
-    pub is_active: bool,
-    pub bytes_holder: Vec<u8>,
+#[derive(Default)]
+struct ByteHandler {
+    pub status: usize,
+    pub buffer: [u8; 3],
 }
 
-impl Default for ByteBufAutomata {
-    fn default() -> Self {
-        Self {
-            is_active: false,
-            bytes_holder: Vec::<u8>::with_capacity(4),
-        }
-    }
-}
-
-impl ByteBufAutomata {
-    fn deactivate(&mut self) {
-        if !self.bytes_holder.is_empty() {
-            let len = self.bytes_holder.len();
-            if len == 1 {
-                assert_eq!(self.bytes_holder[0], 0);
+impl ByteHandler {
+    #[inline]
+    fn reset(&mut self) -> Result<()> {
+        if self.status == 1 {
+            if self.buffer[0] != 0 || self.buffer[1] != 0 || self.buffer[2] != 0 {
+                return Err(Error::DeserializeBadByte);
             }
-            if len == 2 {
-                assert_eq!(self.bytes_holder[0], 0);
-                assert_eq!(self.bytes_holder[1], 0);
+        } else if self.status == 2 {
+            if self.buffer[1] != 0 || self.buffer[2] != 0 {
+                return Err(Error::DeserializeBadByte);
             }
-            if len == 3 {
-                assert_eq!(self.bytes_holder[0], 0);
-                assert_eq!(self.bytes_holder[1], 0);
-                assert_eq!(self.bytes_holder[2], 0);
+        } else if self.status == 3 {
+            if self.buffer[2] != 0 {
+                return Err(Error::DeserializeBadByte);
             }
         }
-        self.bytes_holder.clear();
-        self.is_active = false;
+        self.status = 0;
+        Ok(())
     }
 
-    fn activate_and_take<R: WordRead>(&mut self, reader: &mut R) -> Result<u8> {
-        if !self.is_active {
-            assert!(self.bytes_holder.is_empty());
-            self.is_active = true;
-        }
-        if !self.bytes_holder.is_empty() {
-            Ok(self.bytes_holder.pop().unwrap())
+    #[inline]
+    fn handle_byte<R: WordRead>(&mut self, reader: &mut R) -> Result<u8> {
+        if self.status != 0 {
+            let res = self.buffer[self.status - 1];
+            self.status = (self.status + 1) % 4;
+            Ok(res)
         } else {
             let mut val = 0u32;
             reader.read_words(core::slice::from_mut(&mut val))?;
-            self.bytes_holder = vec![
-                (val >> 24 & 0xff) as u8,
-                (val >> 16 & 0xff) as u8,
+            self.buffer = [
                 (val >> 8 & 0xff) as u8,
+                (val >> 16 & 0xff) as u8,
+                (val >> 24 & 0xff) as u8,
             ];
+            self.status = 1;
             Ok((val & 0xff) as u8)
         }
     }
 }
 
-macro_rules! activate_byte_buf_automata_and_take {
-    ($self_name:expr) => {
-        $self_name
-            .byte_buf_automata
-            .activate_and_take(&mut $self_name.reader)?
-    };
-}
-
-macro_rules! deactivate_byte_buf_automata {
-    ($self_name:expr) => {
-        $self_name.byte_buf_automata.deactivate();
-    };
-}
-
-// ******************************************************
-// ******************************************************
-// **** END added in the alternative serialization ****
-// ******************************************************
-// ******************************************************
-
 /// Enables deserializing from a WordRead
 pub struct Deserializer<'de, R: WordRead + 'de> {
     reader: R,
-
-    // ******************************************************
-    // ******************************************************
-    // **** START added in the alternative serialization ****
-    // ******************************************************
-    // ******************************************************
-    byte_buf_automata: ByteBufAutomata,
-
-    // ******************************************************
-    // ******************************************************
-    // **** END added in the alternative serialization ****
-    // ******************************************************
-    // ******************************************************
+    byte_handler: ByteHandler,
     phantom: core::marker::PhantomData<&'de ()>,
 }
 
@@ -246,8 +152,9 @@ impl<'de, 'a, R: WordRead + 'de> serde::de::EnumAccess<'de> for &'a mut Deserial
 
     fn variant_seed<V: DeserializeSeed<'de>>(self, seed: V) -> Result<(V::Value, Self)> {
         let tag = self.try_take_word()?;
-        let val = DeserializeSeed::deserialize(seed, tag.into_deserializer())?;
-        Ok((val, self))
+        let var =
+            DeserializeSeed::deserialize(seed, IntoDeserializer::<Error>::into_deserializer(tag))?;
+        Ok((var, self))
     }
 }
 
@@ -262,10 +169,10 @@ impl<'a, 'de: 'a, R: WordRead + 'de> serde::de::MapAccess<'de> for MapAccess<'a,
     fn next_key_seed<K: DeserializeSeed<'de>>(&mut self, seed: K) -> Result<Option<K::Value>> {
         if self.len > 0 {
             self.len -= 1;
-            return Ok(Some(DeserializeSeed::deserialize(
+            Ok(Some(DeserializeSeed::deserialize(
                 seed,
                 &mut *self.deserializer,
-            )?));
+            )?))
         } else {
             Ok(None)
         }
@@ -287,38 +194,13 @@ impl<'de, R: WordRead + 'de> Deserializer<'de, R> {
     pub fn new(reader: R) -> Self {
         Deserializer {
             reader,
-
-            // ******************************************************
-            // ******************************************************
-            // **** START added in the alternative serialization ****
-            // ******************************************************
-            // ******************************************************
-            byte_buf_automata: ByteBufAutomata::default(),
-
-            // ******************************************************
-            // ******************************************************
-            // **** END added in the alternative serialization ****
-            // ******************************************************
-            // ******************************************************
+            byte_handler: ByteHandler::default(),
             phantom: core::marker::PhantomData,
         }
     }
 
     fn try_take_word(&mut self) -> Result<u32> {
-        // ******************************************************
-        // ******************************************************
-        // **** START added in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
-
-        deactivate_byte_buf_automata!(self);
-
-        // ******************************************************
-        // ******************************************************
-        // **** END added in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
-
+        self.byte_handler.reset()?;
         let mut val = 0u32;
         self.reader.read_words(core::slice::from_mut(&mut val))?;
         Ok(val)
@@ -349,24 +231,11 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        // ******************************************************
-        // ******************************************************
-        // **** START changed in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
-
-        let val = match activate_byte_buf_automata_and_take!(self) {
+        let val = match self.byte_handler.handle_byte(&mut self.reader)? {
             0 => false,
             1 => true,
             _ => return Err(Error::DeserializeBadBool),
         };
-
-        // ******************************************************
-        // ******************************************************
-        // **** END changed in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
-
         visitor.visit_bool(val)
     }
 
@@ -402,20 +271,7 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        // ******************************************************
-        // ******************************************************
-        // **** START added in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
-
-        deactivate_byte_buf_automata!(self);
-
-        // ******************************************************
-        // ******************************************************
-        // **** END added in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
-
+        self.byte_handler.reset()?;
         let mut bytes = [0u8; 16];
         self.reader.read_padded_bytes(&mut bytes)?;
         visitor.visit_i128(i128::from_le_bytes(bytes))
@@ -425,19 +281,7 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        // ******************************************************
-        // ******************************************************
-        // **** START changed in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
-
-        visitor.visit_u8(activate_byte_buf_automata_and_take!(self))
-
-        // ******************************************************
-        // ******************************************************
-        // **** END changed in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
+        visitor.visit_u8(self.byte_handler.handle_byte(&mut self.reader)?)
     }
 
     fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value>
@@ -465,20 +309,7 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     where
         V: Visitor<'de>,
     {
-        // ******************************************************
-        // ******************************************************
-        // **** START added in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
-
-        deactivate_byte_buf_automata!(self);
-
-        // ******************************************************
-        // ******************************************************
-        // **** END added in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
-
+        self.byte_handler.reset()?;
         let mut bytes = [0u8; 16];
         self.reader.read_padded_bytes(&mut bytes)?;
         visitor.visit_u128(u128::from_le_bytes(bytes))
@@ -681,17 +512,16 @@ mod tests {
     #[test]
     fn test_enum_unary() {
         let a = MyEnum::MyUnaryConstructor(vec![1, 2, 3, 4, 5]);
-        let encoded = crate::to_vec(&a).unwrap();
-        println!("{:?}", encoded);
-        let decoded: MyEnum = from_slice(&encoded).unwrap();
+        let encoded = crate::to_vec_compact(&a).unwrap();
+        let decoded: MyEnum = from_slice_compact(&encoded).unwrap();
         assert_eq!(a, decoded);
     }
 
     #[test]
     fn test_enum_binary() {
         let a = MyEnum::MyBinaryConstructor(vec![1, 2, 3, 4, 5], SomeStruct {});
-        let encoded = crate::to_vec(&a).unwrap();
-        let decoded: MyEnum = from_slice(&encoded).unwrap();
+        let encoded = crate::to_vec_compact(&a).unwrap();
+        let decoded: MyEnum = from_slice_compact(&encoded).unwrap();
         assert_eq!(a, decoded);
     }
 
@@ -743,7 +573,7 @@ mod tests {
             u64: 7,
             f64: 2.71,
         };
-        assert_eq!(expected, from_slice(&words).unwrap());
+        assert_eq!(expected, from_slice_compact(&words).unwrap());
     }
 
     #[test]
@@ -761,6 +591,6 @@ mod tests {
             first: "a".into(),
             second: "abc".into(),
         };
-        assert_eq!(expected, from_slice(&words).unwrap());
+        assert_eq!(expected, from_slice_compact(&words).unwrap());
     }
 }

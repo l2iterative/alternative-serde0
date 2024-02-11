@@ -1,15 +1,15 @@
-## Alternative serialization for RISC Zero
+## Smaller serialization for RISC Zero
 
 <img src="title.png" align="right" alt="a group of people in a very crowded train" width="300"/>
 
-:warning: This repository is now obsolete as the algorithm it uses has been challenged due to RISC Zero's another data structure, FdWriter.
+This repository implements a different algorithm for RISC Zero's serialization and has been 
+circulated for discussion in https://github.com/risc0/risc0/pull/1303.
 
-A different algorithm is currently being circulated for discussion and extra review in https://github.com/risc0/risc0/pull/1303.
+There is a chance that this algorithm may become the official serializer in RISC Zero, but there are 
+issues pending to be resolved. 
 
-### Previous readme
-
-This repository presents an alternative serialization for RISC Zero that handles `Vec<u8>` as well as some tuples in a 
-more compact format.
+In the meantime, developers can use this serializer in their own implementation for customized serialization and 
+deserialization. 
 
 ### Motivation
 
@@ -85,20 +85,12 @@ Prior discussion shows that a bottom-up approach can be disastrous. This reposit
 other words, we do not require any modification to the existing data structures implemented in Rust, but instead, we 
 present a serializer that converts RISC Zero input into `Vec<u32>`, with the corresponding deserialization.
 
-The idea is to run a finite-state automata (called `ByteBufAutomata`) alongside the serialization, and when it 
-observes several continuous u8 being serialized together, it temporarily modifies the way of serialization so that 
-it resembles the padded-to-word approach that RISC Zero recommends. 
+The idea is to have a side buffer, which we call `ByteBuffer`, managed by `ByteHandler`. When it observes several 
+continuous u8 being serialized, it tries to put them together rather than having each of them occupying a word.
 
-The finite-state automata, throughout the process, is being activated and deactivated.
-- **Activate:** It activates when it encounters a `u8`.
-- **Deactivate:** Serializing the rest of the basic types would deactivate it. 
-
-When the machine is active, serializing and deserializing over `u8` would be different.
-- **Serialize:** If the previous `u8` has not taken a full word, the new `u8` would be snuck into that word. Otherwise,
-  a new word is created. 
-- **Deserialize:** To read a single `u8`, the automata reads an entire word, converts it into four bytes, and supplies 
-these four bytes. This process repeats until the automata is deactivated, at which moment either there are not remaining 
-bytes or all the remaining bytes are zeros.
+The byte buffer consists of four bytes. So when there are four bytes in the buffer, a word would be produced, and the 
+buffer would be emptied. When something other than a byte is being serialized, the byte handler would immediately emit 
+a word and clean up the buffer.
 
 Detail of the implementation can be found in the codebase. Below we summarize the main changes in the code.
 
@@ -123,25 +115,32 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
 // New
 impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     fn serialize_u8(self, v: u8) -> Result<()> {
-        activate_byte_buf_automata_and_take!(self, v);
-        Ok(())
+        self.byte_handler.handle(&mut self.stream, v)
     }
 
     fn serialize_u32(self, v: u32) -> Result<()> {
-        deactivate_byte_buf_automata!(self);
-        self.stream.write_word(v);
-        Ok(())
+        self.byte_handler.reset(&mut self.stream)?;
+        let res = self.stream.write_words(&[v]);
+
+        if res.is_err() {
+            return Err(Error::from(res.unwrap_err()));
+        } else {
+            return Ok(res.unwrap());
+        }
     }
 }
 ```
 
-The main changes are `activate_byte_buf_automata_and_take!(self)` and `deactivate_byte_buf_automata!(self)`, 
-which are helpful macros that activate or deactivate the automata.
+The main changes are `self.byte_handler.handle()` and `self.byte_handler.reset()`. 
+- `Handle` passes over a byte to the byte handler so that this byte would be emitted together with other bytes into a 
+word when appropriate.
+- `Reset` tells the byte handler that something other than a byte is going to be serialized, and whatever in the buffer 
+must be emitted, and the buffer needs to be emptied.
 
 ### Deserialization
 
-Similarly, the code change outside the automata is minimal, consisting of redirection on `deserialize_u8` and 
-insertions of `activate_byte_buf_automata_and_take!(self)` and `deactivate_byte_buf_automata!(self)` macro calls.
+Similarly, the code change consists of redirection on `deserialize_u8` and insertions of 
+`activate_byte_buf_automata_and_take!(self)` and `deactivate_byte_buf_automata!(self)` macro calls.
 
 ```rust
 // old
@@ -168,21 +167,82 @@ impl<'de, 'a, R: WordRead + 'de> serde::Deserializer<'de> for &'a mut Deserializ
     fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value>
         where
             V: Visitor<'de>,
-    {
-        visitor.visit_u8(activate_byte_buf_automata_and_take!(self))
+    {   
+        visitor.visit_u8(self.byte_handler.handle_byte(&mut self.reader)?)
     }
 
     fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        deactivate_byte_buf_automata!(self);
+        self.byte_handler.reset()?;
         let mut bytes = [0u8; 16];
         self.reader.read_padded_bytes(&mut bytes)?;
         visitor.visit_u128(u128::from_le_bytes(bytes))
     }
 }
 ```
+
+### Handling one corner case
+
+The high-level plan described above has a limitation. Since the byte handler is withholding bytes, and that the serializer
+would not notify the byte handler when it reaches the end of serialization, there is a situation when the byte handler 
+is unable to emit the bytes into a word because the serialization has been completed. 
+
+This is a tricky issue that requires special attention. Our strategy is to observe that, first of all, we can split all types in Rust into three groups.
+- primitive types:
+  * bool, u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64, char, str,
+  * ()
+  * unit struct aka "struct Nothing"
+  * unit enum aka "enum{ A, B, C }" with no underlying variables
+- "newtype", a virtually pseudo type defined over another type, which is specifically defined for efficiency
+  * Option<T>, which can be considered as `enum { None, Some(T) }`
+  * newtype struct, aka `struct(T)`
+  * newtype variant, aka `enum { struct1(T1), struct2(T2), ... }`
+- wrapper:
+  * seq, including vec![], long slice
+  * tuple aka `(T1, T2)`
+  * tuple struct aka `struct(T1, T2)`
+  * tuple variant aka `enum { struct1(T1, T2), struct2(T3, T4, T5) }`
+  * map
+  * struct aka `struct { a: A, b: B}`
+  * struct variant aka `enum { struct1 {a: T1, b:T2}, struct2{a: T3, b: T4, c: T5) }`
+
+Note that if the buffered bytes have not been fully written to the stream, it means that the last primitive type being 
+written has to be either bool or u8 (we will just treat bool as u8 in the following). There are no primitive types after it, 
+otherwise it would be written to the stream because the byte handler would be reset.
+
+So, there are only two possibilities of this u8.
+- the variable to be serialized is directly or indirectly inside some sort of a wrapper. By "indirectly", it means that `struct { Option<struct(Option<u8>)> }` will also be considered as "inside a wrapper".
+- the variable to be serialized is not inside any wrapper. It could be `u8` or `Option<struct(Option<u8>)>`.
+
+We handle both separately.
+
+For the first case, we introduce a notion of "depth". When serializer enters a wrapper, the depth is increased by one, when it leaves the wrapper, the depth is decreased by one. When the depth is zero, it means that it must have left the last layer of meaningful wrapper, and there are no new bytes possible after it. It needs to be immediately written to the stream when the depth hits zero. The implementation looks like this:
+```rust
+    #[inline]
+    fn decrease_depth<W: WordWrite>(&mut self, stream: &mut W) -> Result<()> {
+        self.depth -= 1;
+        if self.depth == 0 && self.status != 0 {
+            stream.write_words(&[self.byte_holder])?;
+            self.status = 0;
+        }
+        Ok(())
+    }
+```
+
+For the second case, we notice that the last u8 is in depth 0, and therefore, this u8 is put into the buffer and immediately being written down into the stream, i.e., treating u8 as u32.
+```rust
+     fn handle<W: WordWrite>(&mut self, stream: &mut W, v: u8) -> Result<()> {
+        if self.depth == 0 {
+            stream.write_words(&[v as u32])?;
+        } else {
+            ......
+        }
+        Ok(())
+    }
+```
+
 
 ### Result
 
@@ -199,22 +259,13 @@ fn test() {
 
 Our experiment shows that it can correctly serialize them into the compact format in `Vec<u32>`.
 
-### Relation to our Bonsai PHP SDK
-
-It is important to clarify that the [Bonsai PHP SDK](https://github.com/l2iterative/bonsai-sdk-php) repository implements 
-the standard RISC Zero serialization, not the alternative one here. But the alternative serialization does have the 
-benefit because now `Vec<u8>` in Rust is being treated similar to `string` in PHP, which is a binary-safe version of 
-byte buffer.
-
-We may update the Bonsai PHP SDK, but we warn that there are going to be overhead. The fact that short u8 vectors are 
-being treated as tuples force us to serialize some tuples in the same way, and PHP needs to conform to these existing 
-serde practice.
-
 ### Updates
 
-Note that the serialization algorithm is completely different from previous commits due to discussion in https://github.com/risc0/risc0/issues/1298.
+This algorithm has been completed changed several times to handle different corner cases.
 
-I would like to credit @austinabell for the thought process of leading to this new algorithm.
+It is necessary to credit @austinabell, @flaub, and @nategraf for the thought process of leading to this new algorithm.
+
+Readers interested in the algorithm can check the pending PR: https://github.com/risc0/risc0/pull/1303.
 
 ### License
 

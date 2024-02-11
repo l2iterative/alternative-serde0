@@ -1,17 +1,14 @@
 [package]
-name = "alternative_risc0_serde"
+name = "l2r0-small-serde"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-risc0-zkvm = {version = "0.19.1" }
-risc0-zkvm-platform = { version = "0.19.1"}
-serde = { version = "1.0.195", features = ["derive"] }
-bytemuck = { version = "1.14.0", features = [] }
-bytes = { version = "1.5.0", features = [] }
-
+risc0-zkvm = {version = "0.20.1" , default-features = false }
+serde = { version = "1.0.196", features = ["derive"] }
+bytemuck = { version = "1.14.3", features = [] }
 
 # Always optimize; otherwise tests take excessively long.
 [profile.dev]

@@ -12,139 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use alloc::rc::Rc;
 use alloc::vec::Vec;
-use std::cell::RefCell;
-
-use risc0_zkvm_platform::WORD_SIZE;
+use risc0_zkvm::serde::WordWrite;
 
 use super::err::{Error, Result};
 
-/// A writer for writing streams preferring word-based data.
-pub trait WordWrite {
-    // ******************************************************
-    // ******************************************************
-    // **** START added in the alternative serialization ****
-    // ******************************************************
-    // ******************************************************
-
-    /// Access the last word
-    fn get_last_word(&self) -> u32;
-
-    /// Modify the last word
-    fn set_last_word(&mut self, last_word: u32);
-
-    /// Write the given word to the stream.
-    fn write_word(&mut self, word: u32);
-
-    // ******************************************************
-    // ******************************************************
-    // **** END added in the alternative serialization ****
-    // ******************************************************
-    // ******************************************************
-
-    /// Write the given words to the stream.
-    fn write_words(&mut self, words: &[u32]);
-
-    /// Write the given bytes to the stream, padding up to the next word
-    /// boundary.
-    // TODO: Do we still want to to pad the bytes now that we have
-    // posix-style I/O that can read things into buffers right where
-    // we want them to be?  If we don't, we could change the
-    // serialization buffers to use Vec<u8> instead of Vec<u32>,
-    fn write_padded_bytes(&mut self, bytes: &[u8]);
-}
-
-impl WordWrite for Vec<u32> {
-    // ******************************************************
-    // ******************************************************
-    // **** START added in the alternative serialization ****
-    // ******************************************************
-    // ******************************************************
-
-    #[inline]
-    fn get_last_word(&self) -> u32 {
-        let len = self.len();
-        self[len - 1]
-    }
-
-    #[inline]
-    fn set_last_word(&mut self, last_word: u32) {
-        let len = self.len();
-        self[len - 1] = last_word;
-    }
-
-    #[inline]
-    fn write_word(&mut self, word: u32) {
-        self.push(word);
-    }
-
-    // ******************************************************
-    // ******************************************************
-    // **** END added in the alternative serialization ****
-    // ******************************************************
-    // ******************************************************
-
-    #[inline]
-    fn write_words(&mut self, words: &[u32]) {
-        self.extend_from_slice(words);
-    }
-
-    #[inline]
-    fn write_padded_bytes(&mut self, bytes: &[u8]) {
-        let chunks = bytes.chunks_exact(WORD_SIZE);
-        let last_word = chunks.remainder();
-        self.extend(chunks.map(|word_bytes| u32::from_le_bytes(word_bytes.try_into().unwrap())));
-        if !last_word.is_empty() {
-            let mut last_word_bytes = [0u8; WORD_SIZE];
-            last_word_bytes[..last_word.len()].clone_from_slice(last_word);
-            self.push(u32::from_le_bytes(last_word_bytes));
-        }
-    }
-}
-
-// Allow borrowed WordWrites to work transparently.
-impl<W: WordWrite + ?Sized> WordWrite for &mut W {
-    // ******************************************************
-    // ******************************************************
-    // **** START added in the alternative serialization ****
-    // ******************************************************
-    // ******************************************************
-
-    #[inline]
-    fn get_last_word(&self) -> u32 {
-        (**self).get_last_word()
-    }
-
-    #[inline]
-    fn set_last_word(&mut self, last_word: u32) {
-        (**self).set_last_word(last_word)
-    }
-
-    #[inline]
-    fn write_word(&mut self, word: u32) {
-        (**self).write_word(word)
-    }
-
-    // ******************************************************
-    // ******************************************************
-    // **** END added in the alternative serialization ****
-    // ******************************************************
-    // ******************************************************
-
-    #[inline]
-    fn write_words(&mut self, words: &[u32]) {
-        (**self).write_words(words)
-    }
-
-    #[inline]
-    fn write_padded_bytes(&mut self, bytes: &[u8]) {
-        (**self).write_padded_bytes(bytes)
-    }
-}
-
 /// Serialize to a vector of u32 words
-pub fn to_vec<T>(value: &T) -> Result<Vec<u32>>
+pub fn to_vec_compact<T>(value: &T) -> Result<Vec<u32>>
 where
     T: serde::Serialize + ?Sized,
 {
@@ -160,7 +34,7 @@ where
 ///
 /// Includes a caller-provided hint `cap` giving the capacity of u32 words
 /// necessary to serialize `value`.
-pub fn to_vec_with_capacity<T>(value: &T, cap: usize) -> Result<Vec<u32>>
+pub fn to_vec_compact_with_capacity<T>(value: &T, cap: usize) -> Result<Vec<u32>>
 where
     T: serde::Serialize + ?Sized,
 {
@@ -170,69 +44,62 @@ where
     Ok(vec)
 }
 
-// ******************************************************
-// ******************************************************
-// **** START added in the alternative serialization ****
-// ******************************************************
-// ******************************************************
-
 #[derive(Default)]
-struct ByteBufAutomata(pub u8);
+struct ByteHandler {
+    pub status: u8,
+    pub depth: u8,
+    pub byte_holder: u32,
+}
 
-impl ByteBufAutomata {
-    #[inline(always)]
-    fn deactivate(&mut self) {
-        self.0 = 0;
+impl ByteHandler {
+    #[inline]
+    fn increase_depth(&mut self) -> Result<()> {
+        self.depth += 1;
+        Ok(())
     }
 
-    fn activate_and_take<W: WordWrite>(&mut self, stream: &mut W, v: u8) {
-        if self.0 == 0 {
-            stream.write_word(v as u32);
-            self.0 = 1;
-        } else {
-            let w = stream.get_last_word();
-            stream.set_last_word(w | ((v as u32) << (self.0 as usize * 8)));
-            self.0 = (self.0 + 1) % 4;
+    #[inline]
+    fn decrease_depth<W: WordWrite>(&mut self, stream: &mut W) -> Result<()> {
+        self.depth -= 1;
+        if self.depth == 0 && self.status != 0 {
+            stream.write_words(&[self.byte_holder])?;
+            self.status = 0;
         }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn reset<W: WordWrite>(&mut self, stream: &mut W) -> Result<()> {
+        if self.status != 0 {
+            stream.write_words(&[self.byte_holder])?;
+        }
+        self.status = 0;
+        Ok(())
+    }
+
+    fn handle<W: WordWrite>(&mut self, stream: &mut W, v: u8) -> Result<()> {
+        if self.depth == 0 {
+            stream.write_words(&[v as u32])?;
+        } else {
+            if self.status == 0 {
+                self.byte_holder = v as u32;
+                self.status = 1;
+            } else {
+                self.byte_holder |= (v as u32) << (self.status as usize * 8);
+                self.status = (self.status + 1) % 4;
+                if self.status == 0 {
+                    stream.write_words(&[self.byte_holder])?;
+                }
+            }
+        }
+        Ok(())
     }
 }
-
-macro_rules! activate_byte_buf_automata_and_take {
-    ($self_name:ident, $v: expr) => {
-        $self_name
-            .byte_buf_automata
-            .borrow_mut()
-            .activate_and_take(&mut $self_name.stream, $v)
-    };
-}
-
-macro_rules! deactivate_byte_buf_automata {
-    ($self_name:ident) => {
-        $self_name.byte_buf_automata.borrow_mut().deactivate();
-    };
-}
-
-// ******************************************************
-// ******************************************************
-// **** END added in the alternative serialization ****
-// ******************************************************
-// ******************************************************
 
 /// Enables serializing to a stream
 pub struct Serializer<W: WordWrite> {
     stream: W,
-
-    // ******************************************************
-    // ******************************************************
-    // **** START added in the alternative serialization ****
-    // ******************************************************
-    // ******************************************************
-    byte_buf_automata: Rc<RefCell<ByteBufAutomata>>,
-    // ******************************************************
-    // ******************************************************
-    // **** END added in the alternative serialization ****
-    // ******************************************************
-    // ******************************************************
+    byte_handler: ByteHandler,
 }
 
 impl<W: WordWrite> Serializer<W> {
@@ -242,18 +109,7 @@ impl<W: WordWrite> Serializer<W> {
     pub fn new(stream: W) -> Self {
         Serializer {
             stream,
-
-            // ******************************************************
-            // ******************************************************
-            // **** START added in the alternative serialization ****
-            // ******************************************************
-            // ******************************************************
-            byte_buf_automata: Rc::new(RefCell::new(ByteBufAutomata::default())),
-            // ******************************************************
-            // ******************************************************
-            // **** END added in the alternative serialization ****
-            // ******************************************************
-            // ******************************************************
+            byte_handler: ByteHandler::default(),
         }
     }
 }
@@ -268,57 +124,36 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     type SerializeMap = Self;
     type SerializeStruct = Self;
     type SerializeStructVariant = Self;
-
     fn is_human_readable(&self) -> bool {
         false
     }
-
     fn collect_str<T>(self, _: &T) -> Result<()>
     where
         T: core::fmt::Display + ?Sized,
     {
         panic!("collect_str")
     }
-
     fn serialize_bool(self, v: bool) -> Result<()> {
         self.serialize_u8(if v { 1 } else { 0 })
     }
-
     fn serialize_i8(self, v: i8) -> Result<()> {
         self.serialize_i32(v as i32)
     }
-
     fn serialize_i16(self, v: i16) -> Result<()> {
         self.serialize_i32(v as i32)
     }
-
     fn serialize_i32(self, v: i32) -> Result<()> {
         self.serialize_u32(v as u32)
     }
-
     fn serialize_i64(self, v: i64) -> Result<()> {
         self.serialize_u64(v as u64)
     }
-
     fn serialize_i128(self, v: i128) -> Result<()> {
         self.serialize_u128(v as u128)
     }
 
     fn serialize_u8(self, v: u8) -> Result<()> {
-        // ******************************************************
-        // ******************************************************
-        // **** START changed in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
-
-        activate_byte_buf_automata_and_take!(self, v);
-        Ok(())
-
-        // ******************************************************
-        // ******************************************************
-        // **** END added in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
+        self.byte_handler.handle(&mut self.stream, v)
     }
 
     fn serialize_u16(self, v: u16) -> Result<()> {
@@ -326,22 +161,14 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_u32(self, v: u32) -> Result<()> {
-        // ******************************************************
-        // ******************************************************
-        // **** START added in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
+        self.byte_handler.reset(&mut self.stream)?;
+        let res = self.stream.write_words(&[v]);
 
-        deactivate_byte_buf_automata!(self);
-
-        // ******************************************************
-        // ******************************************************
-        // **** END added in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
-
-        self.stream.write_word(v);
-        Ok(())
+        if res.is_err() {
+            return Err(Error::from(res.unwrap_err()));
+        } else {
+            return Ok(res.unwrap());
+        }
     }
 
     fn serialize_u64(self, v: u64) -> Result<()> {
@@ -350,22 +177,14 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_u128(self, v: u128) -> Result<()> {
-        // ******************************************************
-        // ******************************************************
-        // **** START added in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
+        self.byte_handler.reset(&mut self.stream)?;
+        let res = self.stream.write_padded_bytes(&v.to_le_bytes());
 
-        deactivate_byte_buf_automata!(self);
-
-        // ******************************************************
-        // ******************************************************
-        // **** END added in the alternative serialization ****
-        // ******************************************************
-        // ******************************************************
-
-        self.stream.write_padded_bytes(&v.to_le_bytes());
-        Ok(())
+        if res.is_err() {
+            return Err(Error::from(res.unwrap_err()));
+        } else {
+            return Ok(res.unwrap());
+        }
     }
 
     fn serialize_f32(self, v: f32) -> Result<()> {
@@ -383,8 +202,13 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     fn serialize_str(self, v: &str) -> Result<()> {
         let bytes = v.as_bytes();
         self.serialize_u32(bytes.len() as u32)?;
-        self.stream.write_padded_bytes(bytes);
-        Ok(())
+        let res = self.stream.write_padded_bytes(bytes);
+
+        if res.is_err() {
+            return Err(Error::from(res.unwrap_err()));
+        } else {
+            return Ok(res.unwrap());
+        }
     }
 
     // NOTE: Serializing byte slices _does not_ currently call serialize_bytes. This
@@ -398,8 +222,13 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     //    features.
     fn serialize_bytes(self, v: &[u8]) -> Result<()> {
         self.serialize_u32(v.len() as u32)?;
-        self.stream.write_padded_bytes(v);
-        Ok(())
+        let res = self.stream.write_padded_bytes(v);
+
+        if res.is_err() {
+            return Err(Error::from(res.unwrap_err()));
+        } else {
+            return Ok(res.unwrap());
+        }
     }
 
     fn serialize_none(self) -> Result<()> {
@@ -451,10 +280,10 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
         self.serialize_u32(variant_index)?;
         value.serialize(self)
     }
-
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq> {
         match len {
             Some(val) => {
+                self.byte_handler.increase_depth()?;
                 self.serialize_u32(val.try_into().unwrap())?;
                 Ok(self)
             }
@@ -463,6 +292,7 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple> {
+        self.byte_handler.increase_depth()?;
         Ok(self)
     }
 
@@ -471,6 +301,7 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
         _name: &'static str,
         _len: usize,
     ) -> Result<Self::SerializeTupleStruct> {
+        self.byte_handler.increase_depth()?;
         Ok(self)
     }
 
@@ -481,6 +312,7 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
         _variant: &'static str,
         _len: usize,
     ) -> Result<Self::SerializeTupleVariant> {
+        self.byte_handler.increase_depth()?;
         self.serialize_u32(variant_index)?;
         Ok(self)
     }
@@ -488,6 +320,7 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap> {
         match len {
             Some(val) => {
+                self.byte_handler.increase_depth()?;
                 self.serialize_u32(val.try_into().unwrap())?;
                 Ok(self)
             }
@@ -496,6 +329,7 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
     }
 
     fn serialize_struct(self, _name: &'static str, _len: usize) -> Result<Self::SerializeStruct> {
+        self.byte_handler.increase_depth()?;
         Ok(self)
     }
 
@@ -506,6 +340,7 @@ impl<'a, W: WordWrite> serde::ser::Serializer for &'a mut Serializer<W> {
         _variant: &'static str,
         _len: usize,
     ) -> Result<Self::SerializeStructVariant> {
+        self.byte_handler.increase_depth()?;
         self.serialize_u32(variant_index)?;
         Ok(self)
     }
@@ -523,7 +358,7 @@ impl<'a, W: WordWrite> serde::ser::SerializeSeq for &'a mut Serializer<W> {
     }
 
     fn end(self) -> Result<()> {
-        Ok(())
+        self.byte_handler.decrease_depth(&mut self.stream)
     }
 }
 
@@ -539,7 +374,7 @@ impl<'a, W: WordWrite> serde::ser::SerializeTuple for &'a mut Serializer<W> {
     }
 
     fn end(self) -> Result<()> {
-        Ok(())
+        self.byte_handler.decrease_depth(&mut self.stream)
     }
 }
 
@@ -555,7 +390,7 @@ impl<'a, W: WordWrite> serde::ser::SerializeTupleStruct for &'a mut Serializer<W
     }
 
     fn end(self) -> Result<()> {
-        Ok(())
+        self.byte_handler.decrease_depth(&mut self.stream)
     }
 }
 
@@ -571,7 +406,7 @@ impl<'a, W: WordWrite> serde::ser::SerializeTupleVariant for &'a mut Serializer<
     }
 
     fn end(self) -> Result<()> {
-        Ok(())
+        self.byte_handler.decrease_depth(&mut self.stream)
     }
 }
 
@@ -594,7 +429,7 @@ impl<'a, W: WordWrite> serde::ser::SerializeMap for &'a mut Serializer<W> {
     }
 
     fn end(self) -> Result<()> {
-        Ok(())
+        self.byte_handler.decrease_depth(&mut self.stream)
     }
 }
 
@@ -610,7 +445,7 @@ impl<'a, W: WordWrite> serde::ser::SerializeStruct for &'a mut Serializer<W> {
     }
 
     fn end(self) -> Result<()> {
-        Ok(())
+        self.byte_handler.decrease_depth(&mut self.stream)
     }
 }
 
@@ -626,7 +461,7 @@ impl<'a, W: WordWrite> serde::ser::SerializeStructVariant for &'a mut Serializer
     }
 
     fn end(self) -> Result<()> {
-        Ok(())
+        self.byte_handler.decrease_depth(&mut self.stream)
     }
 }
 
@@ -685,7 +520,7 @@ mod tests {
             u64: 7,
             f64: 2.71,
         };
-        assert_eq!(expected, to_vec(&input).unwrap().as_slice());
+        assert_eq!(expected, to_vec_compact(&input).unwrap().as_slice());
     }
 
     #[test]
@@ -701,6 +536,6 @@ mod tests {
             first: "a".into(),
             second: "abc".into(),
         };
-        assert_eq!(expected, to_vec(&input).unwrap().as_slice());
+        assert_eq!(expected, to_vec_compact(&input).unwrap().as_slice());
     }
 }
