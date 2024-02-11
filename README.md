@@ -1,6 +1,6 @@
 ## Smaller serialization for RISC Zero
 
-<img src="title.png" align="right" alt="a group of people in a very crowded train" width="300"/>
+<img src="https://github.com/l2iterative/small-serde0/raw/master/title.png" align="right" alt="a group of people in a very crowded train" width="300"/>
 
 This repository implements a different algorithm for RISC Zero's serialization and has been 
 circulated for discussion in https://github.com/risc0/risc0/pull/1303.
